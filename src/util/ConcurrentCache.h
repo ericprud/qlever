@@ -4,9 +4,13 @@
 
 #ifndef QLEVER_CONCURRENTCACHE_H
 #define QLEVER_CONCURRENTCACHE_H
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <utility>
 
 #include "backports/keywords.h"
@@ -15,6 +19,42 @@
 #include "util/Log.h"
 #include "util/MemorySize/MemorySize.h"
 #include "util/Synchronized.h"
+
+// INSTRUMENTATION (temporary, for diagnosing a cache-key-collision bug
+// report): log every lifecycle transition of `computeOnceImpl` /
+// `moveFromInProgressToCache` at ERROR level (so it is visible even at the
+// default `LOGLEVEL=INFO` build), tagged with the calling thread id, a
+// monotonic nanosecond timestamp (so wait/compute durations can be
+// reconstructed by diffing consecutive lines for the same `rip`), and the
+// `ResultInProgress` object's address (a stand-in for "which logical
+// computation episode", since `Key` -- e.g. `QueryCacheKey` -- has neither
+// `std::hash` nor `operator<<` available generically here). The concrete key
+// contents are logged separately, at the `Operation.cpp` call site where the
+// real `QueryCacheKey` type (and its printable `key_` /
+// `locatedTriplesSnapshotIndex_` fields) is visible.
+inline int64_t qlCacheTraceNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+// A fresh id per `computeOnceImpl` call, independent of OS thread id --
+// QLever may interleave multiple logical requests/coroutines on one OS
+// thread, so `std::this_thread::get_id()` alone can't be trusted to
+// disambiguate concurrent calls when pairing an "ENTER" event (before a
+// `ResultInProgress` even exists) with that same call's later events.
+inline int64_t qlCacheTraceNextCallId() {
+  static std::atomic<int64_t> counter{0};
+  return counter.fetch_add(1, std::memory_order_relaxed);
+}
+#define QL_CACHE_TRACE(ripPtr, msg)                                       \
+  AD_LOG_ERROR << "[CacheTrace] t=" << qlCacheTraceNowNs()                \
+               << " thread=" << std::this_thread::get_id()                \
+               << " rip=" << static_cast<const void*>((ripPtr).get())     \
+               << " " << msg << std::endl
+#define QL_CACHE_TRACE_CALL(callId, msg)                            \
+  AD_LOG_ERROR << "[CacheTrace] t=" << qlCacheTraceNowNs()           \
+               << " thread=" << std::this_thread::get_id()           \
+               << " callId=" << (callId) << " " << msg << std::endl
 
 namespace ad_utility {
 
@@ -356,6 +396,16 @@ class ConcurrentCache {
     auto lockPtr = _cacheAndInProgressMap.wlock();
     AD_CONTRACT_CHECK(lockPtr->_inProgress.contains(key));
     bool pinned = lockPtr->_inProgress[key].first;
+    // INSTRUMENTATION: canary re-check of contains() while still holding the
+    // lock, immediately before the call that throws if it's already present
+    // -- if this ever prints `alreadyContained=1`, the "already present"
+    // exception below is not a fluke of a torn/inconsistent read, it's a
+    // genuine second insert of a key that's already there.
+    bool alreadyContained = lockPtr->_cache.contains(key);
+    QL_CACHE_TRACE(lockPtr->_inProgress[key].second,
+                   "moveFromInProgressToCache: about to insert"
+                   " pinned=" << pinned
+                   << " alreadyContained=" << alreadyContained);
     if (pinned) {
       lockPtr->_cache.insertPinned(std::move(key),
                                    std::move(computationResult));
@@ -379,10 +429,13 @@ class ConcurrentCache {
     using std::shared_ptr;
     bool mustCompute;
     shared_ptr<ResultInProgress> resultInProgress;
+    const int64_t callId = qlCacheTraceNextCallId();
+    QL_CACHE_TRACE_CALL(callId, "ENTER, about to acquire decision lock");
     // first determine whether we have to compute the result,
     // this is done atomically by locking the storage for the whole time
     {
       auto lockPtr = _cacheAndInProgressMap.wlock();
+      QL_CACHE_TRACE_CALL(callId, "decision lock acquired");
       auto& cache = lockPtr->_cache;
       const auto cacheStatus = getCacheStatus(cache, key);
       if (pinned) {
@@ -405,21 +458,27 @@ class ConcurrentCache {
         mustCompute = false;
         // store a handle to the computation.
         resultInProgress = lockPtr->_inProgress[key].second;
+        QL_CACHE_TRACE(resultInProgress, "registered as WAITER callId=" << callId);
       } else {
         // we are the first to compute this result, setup a blank
         // result to which we can write.
         mustCompute = true;
         resultInProgress = make_shared<ResultInProgress>();
         lockPtr->_inProgress[key] = std::pair(pinned, resultInProgress);
+        QL_CACHE_TRACE(resultInProgress,
+                       "registered as COMPUTER (mustCompute) callId=" << callId);
       }
     }  // release the lock, it is not required while we are computing
     if (mustCompute) {
       AD_LOG_TRACE << "Not in the cache, need to compute result" << std::endl;
       try {
         // The actual computation
+        QL_CACHE_TRACE(resultInProgress, "COMPUTER: computeFunction() starting");
         shared_ptr<Value> result = make_shared<Value>(computeFunction());
+        QL_CACHE_TRACE(resultInProgress, "COMPUTER: computeFunction() returned");
         if (suitableForCache(*result)) {
           moveFromInProgressToCache(key, result);
+          QL_CACHE_TRACE(resultInProgress, "insert succeeded, finishing");
           // Signal other threads who are waiting for the results.
           resultInProgress->finish(result);
         } else {
@@ -429,10 +488,18 @@ class ConcurrentCache {
         }
         // result was not cached
         return {std::move(result), CacheStatus::computed};
-      } catch (...) {
+      } catch (const std::exception& e) {
+        QL_CACHE_TRACE(resultInProgress,
+                       "COMPUTER caught exception, aborting: " << e.what());
         // Other threads may try this computation again in the future
         _cacheAndInProgressMap.wlock()->_inProgress.erase(key);
         // Result computation has failed, signal the other threads,
+        resultInProgress->abort();
+        throw;
+      } catch (...) {
+        QL_CACHE_TRACE(resultInProgress,
+                       "COMPUTER caught non-std::exception, aborting");
+        _cacheAndInProgressMap.wlock()->_inProgress.erase(key);
         resultInProgress->abort();
         throw;
       }
@@ -440,7 +507,17 @@ class ConcurrentCache {
       // someone else is computing the result, wait till it is finished and
       // return the result, we do not count this case as "cached" as we had to
       // wait.
-      auto resultPointer = resultInProgress->getResult();
+      QL_CACHE_TRACE(resultInProgress,
+                     "WAITER: about to block in getResult() callId=" << callId);
+      std::shared_ptr<const Value> resultPointer;
+      try {
+        resultPointer = resultInProgress->getResult();
+        QL_CACHE_TRACE(resultInProgress, "WAITER: getResult() returned");
+      } catch (const std::exception& e) {
+        QL_CACHE_TRACE(resultInProgress,
+                       "WAITER: getResult() threw: " << e.what());
+        throw;
+      }
       if (!resultPointer) {
         // Fallback computation
         auto mutablePointer = make_shared<Value>(computeFunction());

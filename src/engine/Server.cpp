@@ -13,7 +13,9 @@
 #include <absl/strings/str_cat.h>
 #include <absl/strings/str_join.h>
 
+#include <chrono>
 #include <string>
+#include <thread>
 #include <variant>
 #include <vector>
 
@@ -1149,18 +1151,37 @@ UpdateMetadata Server::processUpdateImpl(
   const auto& qet = plannedUpdate.queryExecutionTree();
   AD_CORRECTNESS_CHECK(plannedUpdate.parsedQuery().hasUpdateClause());
 
+  // INSTRUMENTATION (temporary, for diagnosing a cache-key-collision bug
+  // report): same [CacheTrace] log format as util/ConcurrentCache.h, so an
+  // update's execution/cache-clear window can be correlated against
+  // concurrent computeOnceImpl activity by grepping one prefix.
+  auto qlTraceNowNs = []() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  };
+  AD_LOG_ERROR << "[CacheTrace] t=" << qlTraceNowNs()
+               << " thread=" << std::this_thread::get_id()
+               << " UPDATE: executeUpdate() starting" << std::endl;
   DeltaTriplesCount countBefore = deltaTriples.getCounts();
   UpdateMetadata updateMetadata =
       ExecuteUpdate::executeUpdate(index, plannedUpdate.parsedQuery(), qet,
                                    deltaTriples, cancellationHandle, tracer);
   updateMetadata.countBefore_ = countBefore;
   updateMetadata.countAfter_ = deltaTriples.getCounts();
+  AD_LOG_ERROR << "[CacheTrace] t=" << qlTraceNowNs()
+               << " thread=" << std::this_thread::get_id()
+               << " UPDATE: executeUpdate() returned, about to clearCache()"
+               << std::endl;
 
   tracer.beginTrace("clearCache");
   // Clear the cache, because all cache entries have been invalidated by
   // the update anyway (The index of the located triples snapshot is
   // part of the cache key).
   cache().clearAll();
+  AD_LOG_ERROR << "[CacheTrace] t=" << qlTraceNowNs()
+               << " thread=" << std::this_thread::get_id()
+               << " UPDATE: cache().clearAll() returned" << std::endl;
   namedResultCache().clear();
   tracer.endTrace("clearCache");
 
