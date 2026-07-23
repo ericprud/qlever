@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <thread>
 #include <utility>
 
@@ -19,6 +20,23 @@
 #include "util/Log.h"
 #include "util/MemorySize/MemorySize.h"
 #include "util/Synchronized.h"
+
+// INSTRUMENTATION helper: stringify `key` if it has an `operator<<` (e.g.
+// `QueryCacheKey`, see QueryExecutionContext.h), else fall back to a
+// placeholder -- keeps this header usable for any `Key` type.
+template <typename K>
+concept QlCacheTraceStreamable =
+    requires(std::ostream& os, const K& k) { os << k; };
+template <typename K>
+std::string qlCacheTraceKeyStr(const K& key) {
+  if constexpr (QlCacheTraceStreamable<K>) {
+    std::ostringstream oss;
+    oss << key;
+    return oss.str();
+  } else {
+    return "(unprintable key)";
+  }
+}
 
 // INSTRUMENTATION (temporary, for diagnosing a cache-key-collision bug
 // report): log every lifecycle transition of `computeOnceImpl` /
@@ -396,21 +414,35 @@ class ConcurrentCache {
     auto lockPtr = _cacheAndInProgressMap.wlock();
     AD_CONTRACT_CHECK(lockPtr->_inProgress.contains(key));
     bool pinned = lockPtr->_inProgress[key].first;
-    // INSTRUMENTATION: canary re-check of contains() while still holding the
-    // lock, immediately before the call that throws if it's already present
-    // -- if this ever prints `alreadyContained=1`, the "already present"
-    // exception below is not a fluke of a torn/inconsistent read, it's a
-    // genuine second insert of a key that's already there.
-    bool alreadyContained = lockPtr->_cache.contains(key);
+    // FIX (was: INSTRUMENTATION canary): a concurrent, `_inProgress`
+    // -independent path (`tryInsertIfNotPresent`, invoked from
+    // `Result::cacheDuringConsumption`'s completion callback when some
+    // consumer -- possibly on a different thread -- fully drains a
+    // lazily-streamed `Result`) can legitimately insert this exact key into
+    // `_cache` before we get here. That is not a bug in itself: it is the
+    // same freshly-computed value for the same key, inserted via a
+    // different, uncoordinated but equally legitimate path. The old code
+    // unconditionally called the throwing `Cache::insert()`/`insertPinned()`
+    // here, which treated that race as a fatal "already present" error and
+    // aborted this operation (and cascaded `WaitedForResultWhichThenFailedException`
+    // into every waiter blocked on it) even though the correct value was
+    // already cached. Re-check under the same lock and skip the duplicate
+    // insert instead of throwing, mirroring `tryInsertIfNotPresent`'s logic.
+    bool alreadyContained = pinned
+                                ? lockPtr->_cache.containsAndMakePinnedIfExists(key)
+                                : lockPtr->_cache.contains(key);
     QL_CACHE_TRACE(lockPtr->_inProgress[key].second,
                    "moveFromInProgressToCache: about to insert"
                    " pinned=" << pinned
-                   << " alreadyContained=" << alreadyContained);
-    if (pinned) {
-      lockPtr->_cache.insertPinned(std::move(key),
-                                   std::move(computationResult));
-    } else {
-      lockPtr->_cache.insert(std::move(key), std::move(computationResult));
+                   << " alreadyContained=" << alreadyContained
+                   << " key: " << qlCacheTraceKeyStr(key));
+    if (!alreadyContained) {
+      if (pinned) {
+        lockPtr->_cache.insertPinned(std::move(key),
+                                     std::move(computationResult));
+      } else {
+        lockPtr->_cache.insert(std::move(key), std::move(computationResult));
+      }
     }
     lockPtr->_inProgress.erase(key);
   }
@@ -458,7 +490,8 @@ class ConcurrentCache {
         mustCompute = false;
         // store a handle to the computation.
         resultInProgress = lockPtr->_inProgress[key].second;
-        QL_CACHE_TRACE(resultInProgress, "registered as WAITER callId=" << callId);
+        QL_CACHE_TRACE(resultInProgress, "registered as WAITER callId=" << callId
+                       << " key: " << qlCacheTraceKeyStr(key));
       } else {
         // we are the first to compute this result, setup a blank
         // result to which we can write.
@@ -466,7 +499,8 @@ class ConcurrentCache {
         resultInProgress = make_shared<ResultInProgress>();
         lockPtr->_inProgress[key] = std::pair(pinned, resultInProgress);
         QL_CACHE_TRACE(resultInProgress,
-                       "registered as COMPUTER (mustCompute) callId=" << callId);
+                       "registered as COMPUTER (mustCompute) callId=" << callId
+                       << " key: " << qlCacheTraceKeyStr(key));
       }
     }  // release the lock, it is not required while we are computing
     if (mustCompute) {

@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <memory>
+#include <ostream>
 #include <string>
 
 #include "backports/three_way_comparison.h"
@@ -85,6 +86,14 @@ struct QueryCacheKey {
   template <typename H>
   friend H AbslHashValue(H h, const QueryCacheKey& key) {
     return H::combine(std::move(h), key.key_, key.locatedTriplesSnapshotIndex_);
+  }
+
+  // INSTRUMENTATION (temporary, for diagnosing a cache-key-collision bug
+  // report): lets util/ConcurrentCache.h's generic [CacheTrace] logging
+  // print the actual key content instead of just a pointer identity.
+  friend std::ostream& operator<<(std::ostream& os, const QueryCacheKey& key) {
+    return os << "key_=\"" << key.key_
+               << "\" snapshot=" << key.locatedTriplesSnapshotIndex_;
   }
 };
 
